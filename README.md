@@ -1,4 +1,4 @@
-# Manuel utilisateur cpp-maker v0.7.0
+# Manuel utilisateur cpp-maker v0.8.0
 
 > Moteur de production unifié pour C et C++ : compilation incrémentale, tests, packaging, déploiement, cross-compilation — sans dépendance externe (ni CMake, ni Make, ni shell obligatoire).
 
@@ -17,6 +17,7 @@
 9. [Workflows courants](#9-workflows-courants)
 10. [Dépannage](#10-dépannage)
 11. [Compilation de cpp-maker](#11-compilation-de-cpp-maker)
+12. [Aide-mémoire](#12-aide-mémoire)
 
 ---
 
@@ -24,17 +25,17 @@
 
 ### Qu'est-ce que cpp-maker ?
 
-cpp-maker est un **outil en ligne de commande** (un seul binaire) qui :
+cpp-maker est un **outil en ligne de commande** (un seul binaire, sans dépendance externe obligatoire) qui :
 
 - **Découvre** les sources C/C++ d'un projet à partir de fichiers de configuration TOML ;
-- **Calcule** un graphe de tâches (compilation, archivage, édition de liens, tests) ;
-- **Exécute** ce graphe en parallèle avec une compilation **incrémentale** fiable (empreinte SHA/FNV des entrées) ;
-- **Produit** exécutables, bibliothèques statiques/shared, tests, paquets, et les **déploie** (rsync/scp/local).
+- **Construit** un graphe orienté acyclique (DAG) de tâches : compilation, archivage, édition de liens, link des tests ;
+- **Exécute** ce DAG en parallèle avec une compilation **incrémentale** fiable (empreinte FNV-1a du compilateur, de la ligne de commande et de chaque entrée, plus les dépendances `#include` transitives) ;
+- **Produit** exécutables, bibliothèques statiques/shared, tests, paquets (tar, zip, deb), et les **déploie** (rsync/scp/local).
 
 ### Ce que cpp-maker n'est PAS
 
-- Ce n'est pas un **gestionnaire de paquets** (pas d'équivalent `find_package`, `conan`, `vcpkg`). Il consomme `pkg-config` et des dépendances Git déclaratives.
-- Ce n'est pas un **système de build générique** : la topologie des tâches est fixée (compile → archive/link → test).
+- Ce n'est pas un **gestionnaire de paquets** : il consomme `pkg-config` et des dépendances Git déclaratives, mais n'implémente pas `find_package`, Conan ou vcpkg.
+- Ce n'est pas un **système de build générique** : la topologie des tâches est fixe (compile → archive/link → test-link).
 - Ce n'est pas **CMake** : pas de scripts, pas de `try_compile`, pas de génération de projets IDE.
 
 ### Philosophie
@@ -43,26 +44,27 @@ cpp-maker est un **outil en ligne de commande** (un seul binaire) qui :
 |---|---|
 | **Convention sur configuration** | Un module est un dossier avec `src/`, `include/<nom>/`, `tests/` ; zéro config obligatoire. |
 | **Configuration déclarative** | Tout dans `cpp-maker.toml` + `module.toml`, pas de code exécutable. |
-| **Zéro dépendance** | Utilise `gcc`/`clang` directement, plus `ar`, `pkg-config`, `strip` s'ils existent. |
+| **Zéro dépendance** | `gcc`/`clang` directement ; `ar`, `pkg-config`, `strip`, `ninja` uniquement s'ils sont présents. |
 | **Multi-toolchain** | Une seule config, plusieurs compilateurs/cibles (`-t host,armhf,win64`). |
-| **Incrémental sûr** | Empreinte = hash(tool_version, cmd, size+mtime de chaque entrée). Faux positifs impossibles côté format ; faux négatifs possibles si l'horloge recule. |
+| **Incrémental sûr** | Empreinte = FNV-1a(tool_version, cmd, chemin+taille+mtime de chaque entrée, dépendances `.d`). |
 
 ---
 
 ## 2. Installation et premier projet
 
-### 2.1 Build de cpp-maker
+### 2.1 Compiler cpp-maker
 
-cpp-maker se compile lui-même avec un compilateur C++23 :
+cpp-maker se compile lui-même avec un compilateur C++23 (g++ 13+ ou clang 16+) :
 
 ```sh
-g++ -std=c++23 -O2 -o cpp-maker \
+g++ -std=c++23 -O2 -pthread -o cpp-maker \
     main.cpp util.cpp proc.cpp toml.cpp toolchain.cpp cfg.cpp \
-    build.cpp deps.cpp elf.cpp flags.cpp cmd-build.cpp cmd-config.cpp \
-    cmd-deploy.cpp cmd-helpers.cpp cmd-project.cpp
+    build.cpp deps.cpp elf.cpp output.cpp sanitize.cpp \
+    cmd-backup.cpp cmd-build.cpp cmd-config.cpp cmd-deploy.cpp \
+    cmd-helpers.cpp cmd-project.cpp
 ```
 
-Placez le binaire dans `$PATH` (`/usr/local/bin/cpp-maker`).
+Les 17 fichiers `.cpp` listés ci-dessus sont ceux du dépôt (il n'y a pas de `flags.cpp` : `flags.hpp` est header-only). Placez le binaire dans `$PATH` (`/usr/local/bin/cpp-maker`).
 
 ### 2.2 Créer un projet simple (exécutable C++)
 
@@ -130,7 +132,7 @@ myapp/
 cpp-maker doctor
 ```
 
-Vérifie : configuration, outils (`ar`, `pkg-config`, `ninja`, …), toolchains, dépendances implicites entre modules.
+Vérifie : configuration, outils (`ar`, `pkg-config`, `ninja`, …), toolchains (smoke_compile C/C++, sanitizers, runner), et dépendances implicites entre modules (analyse des `#include`).
 
 ---
 
@@ -138,7 +140,7 @@ Vérifie : configuration, outils (`ar`, `pkg-config`, `ninja`, …), toolchains,
 
 ### 3.1 Projet
 
-Un **projet** = un dossier racine contenant `cpp-maker.toml`. Il définit :
+Un **projet** = un dossier racine contenant `cpp-maker.toml`. Par compatibilité v0.3, un dossier sans `cpp-maker.toml` mais contenant un sous-dossier `src/` est aussi accepté (mode implicite). Le projet définit :
 
 - Le nom, la version, les standards C/C++ par défaut ;
 - Les **modes** de compilation (release, debug, asan, …) ;
@@ -153,13 +155,15 @@ Un **module** = une unité de compilation/linkage. Quatre types :
 |---|---|---|
 | `executable` | un binaire (avec `main()`) | `hello`, `myapp` |
 | `static` | `lib<nom>.a` | `libcore.a` |
-| `shared` | `lib<nom>.so` (ou `.dylib`, `.dll`) | `libfoo.so` |
-| `header-only` | rien (juste des en-têtes publics) | `libstack` |
+| `shared` | `lib<nom>.so` (ou `.dylib`, `.dll` + `.dll.a` sous Windows) | `libfoo.so` |
+| `header-only` | rien (juste des en-têtes publics, sources interdites) | `libstack` |
+
+Un module `header-only` ne peut pas avoir de sources : `Planner::prepare` refuse la configuration sinon. Un module `executable` ne peut pas être une dépendance d'un autre module (`cfg::validate_errors` le refuse).
 
 Chaque module déclare :
-- Ses **sources** (`[sources].dirs` = `["src"]` par défaut) ;
+- Ses **sources** (`[sources].dirs` = `["src"]` par défaut, `[sources].files` pour des exceptions, `[sources].exclude` pour exclure) ;
 - Ses **en-têtes publics** (`[include].public` = `["include"]` par défaut), propagés aux dépendants ;
-- Ses **dépendances** (modules, pkg-config, bibliothèques système).
+- Ses **dépendances** (modules, pkg-config, bibliothèques système, git).
 
 ### 3.3 Workspace
 
@@ -174,37 +178,54 @@ modules = [
 ]
 ```
 
-**Sélection automatique** : si vous êtes dans `libs/core/`, `cpp-maker build` ne compile que `core` et ses dépendances. `--all` (ou `-a`) force tout.
+**Sélection automatique** : si vous êtes dans `libs/core/`, `cpp-maker build` ne compile que `core` et ses dépendances. `--all` (ou `-a`) force tout le workspace.
 
-### 3.4 Tâche
+### 3.4 Tâche et DAG
 
-Une **tâche** est une unité d'exécution (compilation, archivage, link, test-link). Un plan de build est un **DAG** de tâches. Chaque tâche :
-- A des **entrées** (sources, headers, objets) et **sorties** (objets, binaire, archive) ;
-- A une **commande** (argv) et une **empreinte** (hash) qui permet de savoir si elle est à jour ;
-- A des **dépendances** (autres tâches).
+Une **tâche** est une unité d'exécution (compilation, archivage, édition de liens, link des tests). Un plan de build est un **DAG** de tâches, construit par `Planner::run()` :
 
-Le DAG est exécuté par `parallel_jobs()` workers = `min(ncpus - 1, jobs demandés)`.
+1. `topo_order` trie les modules (dépendances d'abord) ;
+2. `Planner::prepare` découvre les sources, résout `pkg-config`, calcule les chemins d'artefacts ;
+3. `emit_module` crée les tâches de compilation puis la tâche de link ;
+4. `emit_tests` (si `--tests` / `test` / `check`) crée le link des tests.
+
+Chaque tâche contient :
+- Un `kind` (`CC`, `CXX`, `AS`, `AR`, `LINK`, `SOLINK`) pour l'affichage ;
+- Un `label` (chemin source ou chemin d'artefact) ;
+- Une `cmd` (argv) ;
+- Des `inputs` et `outputs` ;
+- Un `stamp` (`<output>.stamp`) et un `depfile` (`<output>.d`, pour les compilations).
+
+Le DAG est exécuté par `execute()`, avec `min(ncpus - 1, jobs demandés)` workers en parallèle.
 
 ### 3.5 Empreinte (fingerprint)
 
 Une tâche est **à jour** si :
 1. Toutes ses sorties existent ;
-2. L'empreinte actuelle (hash) est identique à celle stockée dans `<sortie>.stamp`.
+2. Son empreinte actuelle (hash FNV-1a 64 bits) est identique à celle stockée dans `<sortie>.stamp`.
 
-L'empreinte couvre :
+L'empreinte couvre (dans l'ordre) :
 - La version du compilateur (`tool_version`) ;
-- La commande complète (`cmd`) ;
-- Pour chaque entrée : son chemin, sa taille, son mtime. Pour les fichiers sources C/C++, les **dépendances incluses** (via `.d` généré par `-MMD -MP`) sont également hashed.
+- La ligne de commande complète (`cmd`) ;
+- Pour chaque entrée : chemin, taille, mtime. **Important** : pour les tâches de compilation, si le `.d` (généré par `-MMD -MP`) est lisible, il **remplace** la liste des `inputs` (pour capturer les `#include` transitifs).
 
-**Important** : un `touch` sur un header inclus invalide les tâches qui le compilent. Un changement d'options (`-O2` → `-O3`) invalide aussi.
+Le hash est calculé par `util::Hasher` (FNV-1a 64 bits), rendu en 16 caractères hexadécimaux.
+
+**Conséquence pratique** :
+- Un `touch` sur un header inclus recompile tous les fichiers qui l'incluent (via le `.d`) ;
+- Un changement d'options (`-O2` → `-O3`) invalide la tâche ;
+- Un compilateur mis à jour (`gcc-13` → `gcc-14`) invalide tout.
 
 ### 3.6 Lock file
 
-cpp-maker pose un verrou (`flock`) sur `.cpp-maker.lock` pendant toute la durée d'un build/package/install/deploy. Deux invocations concurrentes → la seconde attend en affichant :
+cpp-maker pose un verrou (`flock`) sur `.cpp-maker.lock` pendant toute la durée d'un build/package/install/deploy. Le fichier contient le PID du détenteur. Deux invocations concurrentes → la seconde attend en affichant :
 
 ```
 Processus de compilation déjà lancé, Veuillez attendre... (PID 12345)
+Verrou obtenu, poursuite.
 ```
+
+`cmd_run` **relâche le verrou avant d'exécuter** le binaire (pour permettre à celui-ci d'invoquer cpp-maker à son tour). `cmd_test` ne le relâche pas (les tests ne doivent pas invoquer cpp-maker).
 
 ---
 
@@ -243,13 +264,20 @@ monworkspace/
 
 ### 4.3 Répertoires générés
 
-- `build/<toolchain>/<mode>/obj/<module>/…` — fichiers objet (`.o`) et stamps ;
-- `build/<toolchain>/<mode>/bin/` — exécutables ;
-- `build/<toolchain>/<mode>/lib/` — bibliothèques ;
-- `build/<toolchain>/<mode>/tests/` — exécutables de test ;
-- `build/<toolchain>/<mode>/compile_commands.json` — pour clangd/IDE ;
-- `build/<toolchain>/<mode>/build.ninja` — si `--backend ninja` ;
-- `dist/` — paquets produits par `cpp-maker package`.
+| Chemin | Contenu |
+|---|---|
+| `build/<tc>/<mode>/obj/<module>/<rel_path>.o` | Fichiers objet + `.d` + `.stamp` |
+| `build/<tc>/<mode>/bin/` | Exécutables |
+| `build/<tc>/<mode>/lib/` | Bibliothèques statiques et partagées (+ `.pc`) |
+| `build/<tc>/<mode>/tests/` | Exécutables de test (`<module>-tests`) |
+| `build/<tc>/<mode>/compile_commands.json` | Pour clangd / VSCode |
+| `build/<tc>/<mode>/build.ninja` | Si `--backend ninja` |
+| `build/<tc>/<mode>/install_manifest.txt` | Fichiers installés par `install` |
+| `build/<tc>/<mode>/stage/` | Staging de `package` |
+| `build/generate/<nom>.stamp` | Stamp des étapes `[generate.*]` |
+| `dist/` | Paquets produits |
+| `.cpp-maker.lock` | Verrou de concurrence (contient le PID) |
+| `cpp-maker.lock` | Versions Git verrouillées (à committer) |
 
 ---
 
@@ -273,7 +301,7 @@ jobs = 0                     # 0 = ncpus - 1 ; N>0 = N (plafonné à ncpus-1)
 warnings = ["-Wall", "-Wextra", …]  # options d'avertissement
 static_pic = true            # -fPIC sur les bibliothèques statiques
 defines = []                 # -D supplémentaires
-cflags = []                  # -cflags communs C
+cflags = []                  # flags communs C
 cxxflags = []                # flags communs C++
 ldflags = []                 # flags de link communs
 ```
@@ -285,14 +313,18 @@ ldflags = []                 # flags de link communs
 name = "hello"
 type = "executable"          # executable | static | shared | header-only
 version = "0.1.0"
-standard = "c++23"
+description = "…"            # affiché par 'cpp-maker info -m <nom>'
+standard = "c++23"           # surcharge le [project].standard (ou cxx_standard)
+c_standard = "c17"
 main = "src/main.cpp"        # optionnel : détection auto sinon
+layer = "app"                # optionnel : couche d'architecture
+install = true               # false = non installé par 'install'/'package'
 
 [sources]
 dirs = ["src"]               # dossiers scannés récursivement
 files = ["extra.cpp"]        # sources supplémentaires hors dirs
-exclude = ["src/exp/**"]     # motifs d'exclusion (glob)
-main = "src/main.cpp"
+exclude = ["src/exp/**"]     # motifs d'exclusion (glob : *, **, ?)
+main = "src/main.cpp"        # équivalent à [module].main
 
 [include]
 public = ["include"]         # propagé aux dépendants
@@ -302,6 +334,7 @@ private = ["src"]            # défaut = source_dirs
 modules = ["core", "net"]    # dépendances inter-modules
 pkg_config = ["zlib", "libcurl"]
 system = ["m", "pthread"]    # -lm -lpthread
+system = []                  # aucun par défaut
 
 [flags]
 defines = []                 # -D pour CE module
@@ -313,11 +346,13 @@ ldflags = []
 [tests]
 dirs = ["tests"]             # scanné uniquement si --tests / test / check
 
-[platform.windows]           # surcharge par OS cible
+[platform.windows]           # surcharge par OS cible (linux|windows|macos|android|unix…)
 sources = ["src/win.cpp"]
 defines = ["WIN32_LEAN_AND_MEAN"]
 system = ["ws2_32"]
 ```
+
+**Recherche du `main`** : si `[module].main` / `[sources].main` est défini, il est utilisé. Sinon, le fichier `main.cpp` / `main.c` est cherché dans les sources. Sinon, un scan ligne par ligne cherche `int main(` (regex `(^|\n)\s*int\s+main\s*\(`) dans chaque source ; le premier trouvé devient le `main`, exclu des tests.
 
 ### 5.3 Section `[workspace]`
 
@@ -334,13 +369,14 @@ Chaque chemin est relatif à la racine du projet. Le nom du module est le `name`
 
 ### 5.4 Section `[toolchains.<nom>]`
 
-Voir §7 pour le détail. Exemple :
+Voir §7. Exemple :
 
 ```toml
 [toolchains.armhf]
 prefix = "arm-linux-gnueabihf-"
 sysroot = "/usr/arm-linux-gnueabihf"
-runner = ["qemu-arm", "-L", "/usr/arm-linux-gnueabihf"]   # optionnel
+runner = ["qemu-arm", "-L", "/usr/arm-linux-gnueabihf"]
+extra_flags = ["-mcpu=cortex-a53"]   # ajouté à cflags ET cxxflags
 ```
 
 ### 5.5 Section `[build.modes.<nom>]`
@@ -353,7 +389,7 @@ Voir §6.
 [tests]
 timeout = 300                # secondes par exécutable de test
 [tests.env]
-HOME = "/tmp/testhome"       # {root} remplacé par la racine du projet
+HOME = "/tmp/testhome"       # {root} est remplacé par la racine du projet
 ```
 
 ### 5.7 Section `[package]`
@@ -367,14 +403,18 @@ description = "Mon logiciel"
 homepage = "https://…"
 license = "MIT"
 deb_depends = ["libc6", "libstdc++6"]
-deb_prefix = "/usr"          # préfixe d'installation
+deb_prefix = "/usr"          # préfixe d'installation Debian
 extra_files = ["docs/README.md"]
 checksums = true             # génère SHA256SUMS
 ```
 
+**Formats** :
+- `tar.gz`, `tar.xz`, `zip`, `deb` : archives produites dans `dist/` ;
+- `stage` : pas d'archive, le staging reste dans `build/<tc>/<mode>/stage/<name>-<version>-<os>-<arch>/`.
+
 ### 5.8 Section `[deploy.<nom>]`
 
-Voir `cpp-maker deploy` (§8.14).
+Voir `cpp-maker deploy` (§8.13).
 
 ### 5.9 Section `[generate.<nom>]`
 
@@ -385,7 +425,7 @@ inputs = ["foo.proto"]
 outputs = ["src/foo.pb.cc", "src/foo.pb.h"]
 ```
 
-Exécuté avant chaque build si une entrée a changé.
+Exécuté **avant chaque build** si une entrée a changé. Un stamp est écrit dans `build/generate/<nom>.stamp`.
 
 ### 5.10 Section `[layers]`
 
@@ -395,10 +435,10 @@ Interdit les dépendances ascendantes (architecture en couches) :
 [layers]
 order = ["core", "domain", "app"]
 [layers.app]
-forbid_pkg_config = ["gtk", "qt"]   # app ne peut pas utiliser de GUI
+forbid_pkg_config = ["gtk", "qt"]   # la couche app ne peut pas dépendre de GUI
 ```
 
-Un module de couche `app` ne peut dépendre que de `app` ou de couches inférieures (`domain`, `core`). La validation est faite par `cpp-maker config validate` et au chargement.
+Un module de couche `app` ne peut dépendre que de `app` ou de couches inférieures (`domain`, `core`). La validation est faite par `cfg::validate_layers`, appelée au chargement et par `config validate`.
 
 ### 5.11 Section `[dependencies.git.<alias>]`
 
@@ -411,15 +451,23 @@ subdir = ""                  # sous-dossier du dépôt
 ```
 
 Résolution :
-- Clone `--mirror` dans `~/.cache/cpp-maker/git/<hash>.git` ;
-- Checkout dans `~/.cache/cpp-maker/git/<hash>/<commit>` ;
+- Clone `--mirror` dans `~/.cache/cpp-maker/git/<hash>.git` (ou `$CPP_MAKER_CACHE/git`, `$XDG_CACHE_HOME/cpp-maker/git`, `%LOCALAPPDATA%\cpp-maker\git` sous Windows) ;
+- Checkout `worktree add --detach` dans `<hash>/<commit16>` ;
 - Lock dans `cpp-maker.lock` (ne pas éditer).
+
+Les modules importés sont renommés `<alias>` (pour le module d'entrée) ou `<alias>__<nom>` (pour les autres), et marqués `from_git = true` (non éditables, non installés par le parent).
+
+### 5.12 Rétro-compatibilité v0.3 / v0.4
+
+- v0.3 : `[project].type`, `[layout].source_dirs` / `test_dirs`, `[compiler].cxx` / `cflags` / `cxxflags` / `ldflags`.
+- v0.4 : `[modules.<nom>]` dans `cpp-maker.toml` (chaque module reste à la racine). L'exécutable global v0.4 (sources hors modules) est chargé comme un module de plus, dépendant de tous les `[modules.*]`.
+- Alias : `library` → `static`, `interface` → `header-only`.
 
 ---
 
 ## 6. Modes de compilation
 
-Un **mode** = un ensemble de flags + defines pour compiler et linker. Les modes sont déclarés dans `cpp-maker.toml` :
+Un **mode** = un ensemble de flags + defines pour compiler et linker, plus éventuellement un champ `sanitizer` et un `runner` (ex. valgrind). Les modes sont déclarés dans `cpp-maker.toml` :
 
 ```toml
 [build.modes.release]
@@ -438,6 +486,9 @@ sanitizer = "address"        # ajoute -fsanitize=address
 base = "release"
 flags = ["-O3", "-march=native"]
 link_flags = ["-Wl,--gc-sections"]
+sanitizer = "address,undefined"   # liste acceptée
+runner = "valgrind"
+runner_args = ["--leak-check=full", "--error-exitcode=1"]
 ```
 
 ### Modes prédéfinis
@@ -445,39 +496,40 @@ link_flags = ["-Wl,--gc-sections"]
 | Nom | Flags | Sanitizer / runner | Usage |
 |---|---|---|---|
 | `release` | `-O2`, `NDEBUG` | — | Production |
-| `debug` | `-O0 -g3`, `DEBUG` | — | Développement |
+| `debug` | `-O0 -g3`, `DEBUG` | — | Développement (défaut) |
 | `relwithdebinfo` | `-O2 -g`, `NDEBUG` | — | Profiling |
 | `minsize` | `-Os`, `NDEBUG` | — | Embarqué |
-| `asan` | `-O1 -g3 -fsanitize=address` | address | Détection d'erreurs mémoire |
-| `tsan` | `-O1 -g3 -fsanitize=thread` | thread | Détection de data races |
-| `ubsan` | `-O1 -g3 -fsanitize=undefined` | undefined | Comportement indéfini |
-| `msan` | `-O1 -g3 -fsanitize=memory -fsanitize-memory-track-origins=2` | memory | Lecture de mémoire non initialisée (**clang uniquement**) |
-| `lsan` | `-O1 -g3 -fsanitize=leak` | leak | Fuites mémoire, sans le surcoût d'ASan |
-| `valgrind` | `-O0 -g3` | valgrind | Fuites mémoire |
+| `asan` | `-O1 -g3 -fsanitize=address -fno-omit-frame-pointer` | address | Détection d'erreurs mémoire |
+| `tsan` | `-O1 -g3 -fsanitize=thread -fno-omit-frame-pointer` | thread | Data races |
+| `ubsan` | `-O1 -g3 -fsanitize=undefined -fno-omit-frame-pointer` | undefined | Comportement indéfini |
+| `msan` | `-O1 -g3 -fsanitize=memory -fsanitize-memory-track-origins=2 -fno-omit-frame-pointer` | memory | Mémoire non initialisée (**clang uniquement**) |
+| `lsan` | `-O1 -g3 -fsanitize=leak -fno-omit-frame-pointer` | leak | Fuites, sans ASan |
+| `valgrind` | `-O0 -g3` | valgrind | Fuites (memcheck) |
 
 ### Sélection d'un mode
 
 ```sh
 cpp-maker build                # mode par défaut (debug)
 cpp-maker build release        # mode "release" (positionnel)
-cpp-maker build -m release     # équivalent
-cpp-maker build --mode=asan    # équivalent
+cpp-maker build --mode release # équivalent
 ```
 
-### Surcharge par mode
+### Surcharge multi-modes
+
+`cpp-maker check` compile et lance les tests pour plusieurs modes à la fois :
 
 ```sh
-cpp-maker test --modes debug,asan,tsan   # check multi-modes
+cpp-maker check --modes debug,asan,tsan
 ```
 
 ### Sanitizers à la demande (`--sanitize`)
 
-Au lieu de créer un mode, on peut ajouter des sanitizers au mode choisi depuis la ligne de commande (`build`, `run`, `test`, `check`, `package`…). Le résultat est un mode dérivé, nommé `<mode>+<sanitizers>`, avec son propre dossier `build/<tc>/<mode>+…/` : les objets du mode d'origine ne sont pas écrasés.
+Au lieu de créer un mode, on peut ajouter des sanitizers au mode choisi depuis la ligne de commande (`build`, `run`, `test`, `check`). Le résultat est un **mode dérivé**, nommé `<mode>+<sanitizers>`, avec son propre dossier `build/<tc>/<mode>+…/` : les objets du mode d'origine ne sont pas écrasés.
 
 ```sh
 cpp-maker build --sanitize address,undefined         # → build/host/debug+address+undefined/
 cpp-maker test --sanitize signed-integer-overflow,null --no-sanitize-recover all
-cpp-maker test --sanitize all                        # une passe par runtime (voir ci-dessous)
+cpp-maker test --sanitize all                        # une passe par runtime
 cpp-maker run --cc clang --cxx clang++ --sanitize memory
 cpp-maker build release --sanitize cfi --cc clang --cxx clang++
 ```
@@ -485,42 +537,36 @@ cpp-maker build release --sanitize cfi --cc clang --cxx clang++
 | Option | Effet |
 |---|---|
 | `--sanitize <a,b>` (alias `--sanitizer`) | Ajoute `-fsanitize=<a,b>` (compilation + édition de liens), `-fno-omit-frame-pointer` et `-g`. Répétable. Accepte aussi `-fsanitize=<nom>` et les alias `asan`, `tsan`, `msan`, `lsan`, `ubsan`, `hwasan`. |
-| `--sanitize all` | Une passe par runtime, puisqu'ils ne cohabitent pas dans un même binaire : `address+undefined`, `thread`, `leak`, `memory`, `hwaddress`. Chaque passe a son mode dérivé et son dossier. Les passes impossibles (`memory` sans clang, `hwaddress` hors AArch64/RISC-V, conflit avec le sanitizer du mode) sont ignorées avec un avertissement. Les autres noms (`all,float-divide-by-zero`) s'ajoutent à chaque passe. Pour `build`, `run`, `test` et `check`. |
-| `--sanitize-trap <a,b\|all>` | `-fsanitize-trap=…` : une instruction trap remplace le rapport textuel, ce qui donne un binaire plus léger. |
+| `--sanitize all` | Une passe par runtime (incompatibles entre eux) : `address+undefined`, `thread`, `leak`, `memory`, `hwaddress`. Chaque passe a son mode dérivé et son dossier. Les passes impossibles (`memory` sans clang, `hwaddress` hors AArch64/RISC-V, conflit avec le sanitizer du mode) sont ignorées avec un avertissement. Les autres noms (`all,float-divide-by-zero`) s'ajoutent à chaque passe. **Pour `build`, `run`, `test`, `check` uniquement.** |
+| `--sanitize-trap <a,b\|all>` | `-fsanitize-trap=…` : une instruction trap remplace le rapport textuel (binaire plus léger). |
 | `--sanitize-ignorelist <fichier>` | `-fsanitize-ignorelist=…` : fonctions (`fun:…`) ou sources (`src:…`) à ne pas instrumenter. Clang uniquement. |
 | `--no-sanitize-recover <a,b\|all>` | `-fno-sanitize-recover=…` : le programme s'arrête (abort) à la première erreur au lieu de continuer. |
 
 Sanitizers disponibles (détails : `cpp-maker help sanitize`) :
 
-| Nom | Ce qui est détecté / protégé |
-|---|---|
-| `address` | Accès mémoire invalides : débordements, use-after-free, double free (+ fuites sous Linux). |
-| `thread` | Data races, interblocages. |
-| `memory` | Lectures de mémoire non initialisée (clang). |
-| `leak` | Fuites mémoire. |
-| `hwaddress` | ASan assisté par le matériel (marquage des pointeurs, AArch64/Android). |
-| `undefined` | Groupe UBSan général. |
-| `shift` | Décalages de bits invalides (plus de bits que la taille du type, valeur négative). |
-| `integer-divide-by-zero` | Division entière par zéro. |
-| `float-divide-by-zero` | Division flottante par zéro (hors du groupe `undefined`). |
-| `null` | Utilisation ou déréférencement d'un pointeur nul. |
-| `signed-integer-overflow` | Dépassement de capacité des entiers signés. |
-| `unsigned-integer-overflow` | Dépassement des entiers non signés : pas un UB, mais utile pour les bugs logiques (clang). |
-| `bounds` | Accès hors limites d'un tableau de taille connue. |
-| `alignment` | Pointeurs mal alignés. |
-| `vptr` | Type dynamique incohérent lors d'appels virtuels ou de `dynamic_cast` (C++). |
-| `cfi` | Control Flow Integrity : cibles d'appels indirects valides (clang ; ajoute `-flto -fvisibility=hidden`). |
-| `safe-stack` | Pile séparée en une partie sûre et une partie non sûre (clang). |
-| `shadow-call-stack` | Adresse de retour sauvegardée dans une pile dédiée (AArch64/RISC-V). |
+| Nom | Ce qui est détecté / protégé | Restriction |
+|---|---|---|
+| `address` | Accès mémoire invalides, use-after-free, double free, fuites | — |
+| `thread` | Data races, interblocages | — |
+| `memory` | Lectures de mémoire non initialisée | **clang** |
+| `leak` | Fuites (combinable avec `address` uniquement) | — |
+| `hwaddress` | ASan assisté par le matériel | AArch64/Android |
+| `undefined` | Groupe UBSan général | — |
+| `shift`, `integer-divide-by-zero`, `null`, `signed-integer-overflow`, `bounds`, `alignment`, `vptr` | Vérifications UBSan ciblées | — |
+| `float-divide-by-zero` | Division flottante par zéro (hors `undefined`) | — |
+| `unsigned-integer-overflow` | Dépassement non signé (non-UB) | **clang** |
+| `cfi` | Control Flow Integrity | **clang**, ajoute `-flto -fvisibility=hidden` |
+| `safe-stack` | Pile sûre séparée | **clang** |
+| `shadow-call-stack` | Adresse de retour protégée | AArch64/RISC-V |
 
-Règles de compatibilité vérifiées par cpp-maker : un seul runtime parmi `address`, `hwaddress`, `thread`, `memory` et `safe-stack` ; `leak` ne se combine qu'avec `address`. Les sanitizers réservés à clang provoquent une erreur claire avec GCC. Dans `cpp-maker.toml`, le champ `sanitizer` d'un mode accepte la même liste (`sanitizer = "address,undefined"`).
+Règles vérifiées par `sanitize::check_compatible` : un seul runtime parmi `address`, `hwaddress`, `thread`, `memory`, `safe-stack` ; `leak` ne se combine qu'avec `address`. Dans `cpp-maker.toml`, le champ `sanitizer` d'un mode accepte la même liste.
 
 ### Définir un mode personnalisé
 
 ```toml
 [build.modes.profiling]
 base = "relwithdebinfo"
-flags = ["-fno-omit-frame-pointer", "-g"]
+flags = ["-fno-omit-frame-pointer"]
 link_flags = ["-fno-omit-frame-pointer"]
 ```
 
@@ -528,24 +574,24 @@ link_flags = ["-fno-omit-frame-pointer"]
 
 ## 7. Toolchains
 
-Une **toolchain** = un ensemble de compilateurs (`cc`, `cxx`), d'outils (`ar`, `strip`, `pkg_config`) et d'une cible (`triple`, `arch`, `os`).
+Une **toolchain** = un ensemble de compilateurs (`cc`, `cxx`), d'outils (`ar`, `strip`, `pkg_config`) et d'une cible (`triple`, `arch`, `os`). `resolve()` la construit en interrogeant les outils.
 
 ### Toolchains intégrées
 
-- `host` : `CC`/`CXX` (ou auto-détection : `cl`, `gcc`, `clang`, `tcc`…) ;
+- `host` : `CC`/`CXX` (ou auto-détection : `cl`, `tcc`, `gcc`, `gcc-14`, `clang`, `clang-20`…) ;
 - `gcc` : force `gcc`/`g++` ;
 - `clang` : force `clang`/`clang++` ;
-- Tout triplet du `$PATH` : `cpp-maker build -t arm-linux-gnueabihf`, `cpp-maker build -t x86_64-w64-mingw32`.
+- Tout triplet du `$PATH` : `-t arm-linux-gnueabihf`, `-t x86_64-w64-mingw32`.
 
 ### Toolchains configurées
 
 ```toml
 [toolchains.armhf]
-prefix = "arm-linux-gnueabihf-"   # préfixe des outils
+prefix = "arm-linux-gnueabihf-"
 sysroot = "/usr/arm-linux-gnueabihf"   # --sysroot=…
 os = "linux"                       # "" = déduit du triple
 runner = ["qemu-arm", "-L", "/usr/arm-linux-gnueabihf"]
-extra_flags = ["-mcpu=cortex-a53"] # ajouté aux cflags et cxxflags
+extra_flags = ["-mcpu=cortex-a53"]
 
 [toolchains.win64]
 prefix = "x86_64-w64-mingw32-"
@@ -566,22 +612,15 @@ family = "gcc"                     # auto | gcc | clang
 ### Détection automatique
 
 - `detect_prefixes()` scanne `$PATH` pour les `X-Y-Z-gcc`/`g++` ;
-- `host_candidates()` essaie `$CC`/`$CXX`, puis `cl`, `tcc`, `gcc`, `gcc-14`… `clang`, `clang-20`…
-- `smoke_compile()` valide qu'un compilateur compile un fichier trivial (par défaut, `cpp-maker new` ne choisit qu'un compilateur qui fonctionne).
+- `host_candidates()` essaie `$CC`/`$CXX`, puis `cl`, `tcc`, `gcc`, `gcc-14`… `clang`, `clang-20`… ;
+- `smoke_compile()` valide qu'un compilateur compile un fichier trivial dans le standard demandé ; `cpp-maker new` n'épingle que les compilateurs qui fonctionnent.
 
 ### Cross-compilation
 
 ```sh
-# Utiliser le prefix auto-détecté
 cpp-maker build -t arm-linux-gnueabihf
-
-# Utiliser une toolchain configurée
 cpp-maker build -t armhf
-
-# Toutes les toolchains configurées
 cpp-maker build -t all
-
-# Plusieurs à la fois
 cpp-maker build -t host,armhf,win64
 ```
 
@@ -590,8 +629,8 @@ cpp-maker build -t host,armhf,win64
 Pour `run`, `test`, `check` :
 
 - Si `runner` est défini dans la toolchain → préfixe la ligne de commande ;
-- Sinon, auto-détection : `qemu-arm`/`qemu-aarch64`… pour Linux ARM/RISC-V, `wine`/`wine64` pour Windows ;
-- Sinon, l'exécution est refusée avec un message (`SKIP` en test).
+- Sinon, auto-détection : `qemu-<arch>` pour Linux ARM/RISC-V/MIPS/etc., `wine`/`wine64` pour Windows ;
+- Sinon, l'exécution est refusée avec `runner_note` (`SKIP` en test).
 
 ### Surcharge ad-hoc
 
@@ -604,54 +643,13 @@ cpp-maker build --cxx=/opt/gcc-14/bin/g++
 
 ## 8. Les commandes en détail
 
-Toutes les commandes acceptent `--help` ou `-h` :
+Toutes les commandes acceptent `--help` ou `-h` (`cpp-maker build --help`).
 
-```sh
-cpp-maker build --help
-```
-
-Toutes les commandes qui prennent un mode acceptent :
-- Un **positionnel** : `cpp-maker build release` ;
-- `-m|--mode` : `cpp-maker build -m release`.
-
-Toutes les commandes qui prennent une toolchain acceptent :
-- `-t|--toolchain <nom>` : `-t host`, `-t all` ;
-- Multi-valeurs séparées par virgule : `-t host,armhf`.
-
-Toutes les commandes qui prennent des modules acceptent :
-- `-m <nom>` ou `--module <nom>` : `-m core` ;
-- Multi-valeurs : `-m core,net` ;
-- Défaut : tous les modules du workspace, ou le module courant si vous êtes dans un sous-dossier.
-
-**Note importante** : `-m` est ambigu (module ou mode). cpp-maker résout ainsi :
-- `-m <nom>` (pas de `=`, une seule valeur) → **module** ;
-- `--mode <nom>` ou `--mode=<nom>` → **mode** ;
-- Positionnel + `-m` : `cpp-maker run release -m hello` → mode=release, module=hello.
-
-**Séparateurs `--` et `--args`** (run/test/check) : tout ce qui suit est **transmis à l'exécutable**, sans interprétation par cpp-maker :
-
-```sh
-cpp-maker run -- --verbose --port=8080
-cpp-maker run --args --verbose --port=8080
-```
-
-**Sortie dans un fichier et filtrage (`--output`, `--filter`)** — options globales, acceptées par toutes les commandes, avant ou après le nom de la commande :
-
-| Option | Effet |
-|---|---|
-| `--output <fichier>` | stdout **et** stderr (cpp-maker, compilateur, éditeur de liens, programme lancé…) sont écrits dans `<fichier>` au lieu du terminal. Le fichier est écrasé, sans codes couleur. Un résumé `sortie écrite dans … (N ligne(s))` s'affiche à la fin. |
-| `--filter <motif>` | Ne garde que les lignes qui correspondent au motif, comme `grep` : regex ECMAScript (`error\|warning`), ou texte littéral si le motif n'est pas une regex valide. Répétable : `--filter A --filter B` garde les lignes contenant A **ou** B. S'applique au terminal, ou au fichier si `--output` est donné. |
-| `--grep <motif>` | Synonyme de `--filter`. |
-
-```sh
-cpp-maker build --output build.log                    # tout le journal dans build.log
-cpp-maker build --filter 'error|warning'              # n'affiche que les diagnostics
-cpp-maker build release --output err.log --filter error
-cpp-maker test --grep FAIL                            # filtre la sortie des tests
-cpp-maker --filter FAIL test --filter add             # idem, avec filtre sur les noms de tests
-```
-
-Le code de retour reste celui de la commande (il ne dépend pas du nombre de lignes gardées). Pour `test` et `check`, un `--filter` placé **après** la commande garde son sens d'origine (filtre sur les noms de tests) : utilisez `--grep`, ou placez `--filter` **avant** la commande. Ce qui suit `--` / `--args` n'est jamais interprété.
+**Conventions** :
+- Mode : positionnel (`cpp-maker build release`) ou `--mode <nom>` ;
+- Toolchain : `-t|--toolchain <nom>` (`-t all` pour toutes) ;
+- Modules : `-m|--module <nom>` (multi-valeurs séparées par virgule) ; sans `-m`, tous les modules du workspace (ou le module courant si vous êtes dans un sous-dossier) ;
+- Séparateurs `--` et `--args` (run/test/check) : tout ce qui suit est **transmis à l'exécutable**, sans interprétation par cpp-maker.
 
 ### 8.1 `new` — créer un projet
 
@@ -678,8 +676,8 @@ cpp-maker new <nom> [options]
 
 **Comportement** :
 
-1. Vérifie qu'un compilateur **compile effectivement** un fichier trivial en `-std=<standard>` (essai `smoke_compile`). Si aucun compilateur ne fonctionne, échec avec log complet.
-2. Si le premier candidat n'est pas celui du `$PATH` (`/usr/bin/g++`), **épingle** le compilateur dans `[toolchains.host]` (`cxx = "/chemin/vers/g++"`).
+1. Vérifie qu'un compilateur compile effectivement un fichier trivial en `-std=<standard>` (via `smoke_compile`). Si aucun ne fonctionne, échec avec log complet.
+2. Si le premier candidat n'est pas celui du `$PATH` (`/usr/bin/g++`), **épingle** le compilateur dans `[toolchains.host]` (`cxx = "/chemin/vers/g++"`) pour la reproductibilité.
 3. Génère `cpp-maker.toml`, sources d'exemple, test runner, `README.md`, `.gitignore`.
 4. Ne fait **aucun build**.
 
@@ -689,7 +687,7 @@ cpp-maker new <nom> [options]
 cpp-maker new hello                              # exécutable C++
 cpp-maker new mylib --type static                # bibliothèque statique
 cpp-maker new mylib --type header-only           # header-only
-cpp-maker new app --workspace                    # workspace vide
+cpp-maker new app --workspace                    # workspace
 cpp-maker new app --workspace --lang c           # workspace en C
 cpp-maker new tiny --type static --lang c        # bibliothèque C
 ```
@@ -710,18 +708,17 @@ cpp-maker add <nom|chemin> [options]
 | `--no-scaffold` | flag | — | Ne pas générer les sources |
 
 **Résolution du chemin** :
-
-- Nom simple (`core`) → `<--dir>/<nom>` (par défaut `libs/core`) ;
+- Nom simple (`core`) → `<--dir>/<nom>` (défaut `libs/core`) ;
 - Chemin relatif (`apps/truc`) → interprété **depuis le répertoire d'invocation**, ramené relatif à la racine ;
 - Chemin absolu → tel quel.
 
 **Comportement** :
 
 1. Modifie `[workspace].modules` dans `cpp-maker.toml` (remplacement atomique, revalidation complète) ;
-2. Crée le dossier du module et son `module.toml` ;
-3. Génère des sources d'exemple (sauf `--no-scaffold`) : header, source, test, et `main()` si `executable` ;
-4. Si une dépendance est un module de type bibliothèque avec un `add(int,int)` dans son en-tête public, `main()` généré l'appelle ;
-5. En cas d'erreur de validation, restaure **tout** (fichier + dossier).
+2. Crée le dossier et son `module.toml` ;
+3. Génère des sources d'exemple (sauf `--no-scaffold`) : header, source, test, `main()` si `executable` ;
+4. Si une dépendance est une bibliothèque avec `add(int,int)` dans son en-tête public, `main()` généré l'appelle ;
+5. En cas d'erreur de validation, restaure **tout**.
 
 **Exemples** :
 
@@ -744,9 +741,7 @@ Alias : `cpp-maker add` (voir §8.2).
 
 #### `module rename <ancien> <nouveau>`
 
-Renomme un module :
-
-1. Met à jour `name = "<nouveau>"` dans son `module.toml` ;
+1. Met à jour `name = "<nouveau>"` dans le `module.toml` ;
 2. Met à jour les `[dependencies].modules` de tous les modules qui le référencent ;
 3. Si le nom du dossier == ancien nom, **renomme le dossier** et met à jour `[workspace].modules` ;
 4. En cas d'erreur, restaure tout.
@@ -773,9 +768,12 @@ Gère les dépendances d'un module.
 - `list <module>` : affiche modules, pkg-config, système ;
 - `add <module> <nom>` : ajoute `<nom>` ; type déduit ainsi :
   1. flag explicite (`--module` / `--pkg-config` / `--system`) ;
-  2. `--pkg-config` si `pkg-config --exists <nom>` réussit ;
-  3. `--system` sinon ;
+  2. `--module` si `<nom>` est un module connu ;
+  3. `--pkg-config` si `pkg-config --exists <nom>` réussit ;
+  4. `--system` sinon ;
 - `remove <module> <nom>` : retire `<nom>` de la liste où il figure.
+
+Un nom commençant par `-l` est normalisé (`-lz` → `z`).
 
 ```sh
 cpp-maker module deps list core
@@ -792,10 +790,10 @@ Sous-commandes : `list` (défaut), `update`, `clean`.
 ```sh
 cpp-maker deps list      # affiche les versions verrouillées
 cpp-maker deps update    # ignore le lock, résout les versions, réécrit le lock
-cpp-maker deps clean     # supprime ~/.cache/cpp-maker/git
+cpp-maker deps clean     # supprime le cache local
 ```
 
-Cache : `~/.cache/cpp-maker/git/` (ou `$XDG_CACHE_HOME/cpp-maker/git`, ou `$CPP_MAKER_CACHE/git`).
+Cache : `~/.cache/cpp-maker/git/` (ou `$XDG_CACHE_HOME/cpp-maker/git`, `$CPP_MAKER_CACHE/git`, `%LOCALAPPDATA%\cpp-maker\git` sous Windows).
 
 ### 8.5 `build` — compiler
 
@@ -809,11 +807,12 @@ cpp-maker build [mode] [options]
 | `--tests` | Compile aussi les exécutables de test |
 | `-m <modules>` | Modules à construire (+ leurs dépendances) |
 | `-t <toolchains>` | Toolchains (défaut : celle du projet) |
-| `-j N` / `--jobs N` | Workers (défaut : ncpus - 1) |
+| `-j N` / `--jobs N` | Workers (défaut : ncpus - 1, plafonné à ce budget) |
 | `-k` / `--keep-going` | Continue après les échecs |
 | `-n` / `--dry-run` | Affiche sans exécuter |
 | `-v` / `--verbose` | Affiche chaque commande |
 | `--clean` | Supprime `build/<tc>/<mode>` avant |
+| `--sanitize*` | Voir §6 |
 
 **Backends** :
 
@@ -835,20 +834,18 @@ cpp-maker build [mode] [options]
 Relance immédiate :
 
 ```
-[cpp-maker] hello · toolchain host · mode release
+[cpp-maker] hello · toolchain host (x86_64-linux-gnu) · mode release
             modules : hello
 ✓ rien à faire, tout est à jour (3 tâches)
 ```
 
-**Multi-toolchains** :
+**Notes** :
 
-```sh
-cpp-maker build -t host,armhf,win64
-```
-
-Chaque toolchain est compilée dans son propre répertoire `build/<tc>/<mode>/`. Échec d'une toolchain → code retour 1, les autres continuent.
-
-**`--clean`** : supprime **uniquement** `build/<tc>/<mode>/`, pas tout `build/`.
+- Le nombre de workers est plafonné à `ncpus - 1` (cpp-maker réserve un cœur) ; si `--jobs N` dépasse ce budget, un avertissement unique est émis et la valeur est plafonnée.
+- `compile_commands.json` est régénéré **à chaque** build, à côté du `build.ninja` (dans `build/<tc>/<mode>/`).
+- Les étapes `[generate.*]` sont exécutées avant le build si une entrée a changé.
+- Avec `--sanitize*`, le mode dérivé a son propre dossier (`debug+address`) : les objets du mode d'origine ne sont pas écrasés.
+- En cas d'échec d'une tâche : `<sortie>.stamp` est supprimé (pour forcer la recompilation), et `keep_going = false` arrête le DAG.
 
 ### 8.6 `run` — compiler et exécuter
 
@@ -858,7 +855,7 @@ cpp-maker run [mode] [options] [-- <args>]
 
 | Option | Description |
 |---|---|
-| `-m <module>` | Module exécutable (défaut : module courant si dans un sous-dossier, sinon unique exécutable du projet) |
+| `-m <module>` | Module exécutable (défaut : module courant si dans un sous-dossier exécutable, sinon unique exécutable du projet) |
 | `-t <toolchain>` | Une seule toolchain |
 | `--args ARG…` | Arguments pour l'exécutable |
 | `-- ARG…` | Idem |
@@ -866,9 +863,11 @@ cpp-maker run [mode] [options] [-- <args>]
 **Comportement** :
 
 1. Compile (via `run_plan`) ;
-2. **Relâche le lock** avant d'exécuter (pour permettre à l'exécutable d'invoquer cpp-maker) ;
-3. Applique la chaîne de lancement (runner qemu/wine + valgrind si mode valgrind) ;
+2. **Relâche le lock** avant d'exécuter ;
+3. Applique la chaîne de lancement (`[valgrind …] [runner cible …] binaire`) ;
 4. Transmet `positional` + `passthrough` à l'exécutable.
+
+Si aucun runner n'est disponible pour la cible (cross), l'exécution est refusée avec **code 2**.
 
 **Exemples** :
 
@@ -878,7 +877,7 @@ cpp-maker run -m myapp                     # exécutable myapp
 cpp-maker run release                      # en mode release
 cpp-maker run --args --port 8080 --dev     # arguments typés
 cpp-maker run -- --port 8080 --dev         # idem
-cpp-maker run valgrind                     # via `cpp-maker valgrind` aussi
+cpp-maker valgrind                         # alias de `run --mode valgrind`
 ```
 
 ### 8.7 `test` — compiler et exécuter les tests
@@ -894,7 +893,7 @@ cpp-maker test [mode] [options]
 | `--timeout <s>` | Timeout par exécutable (défaut : `[tests].timeout`) |
 | `-t <toolchain>` | Une seule toolchain |
 
-**Squelette de test généré** (workspace ou projet) :
+**Squelette de test généré** :
 
 ```cpp
 #include "test.hpp"
@@ -911,9 +910,11 @@ Macros disponibles :
 - Alias GTest : `EXPECT_*`, `ASSERT_*`.
 
 **Codes retour** :
-- `0` : tous les tests exécutés réussissent (ou aucun n'est trouvé) ;
+- `0` : tous les tests exécutés réussissent ;
 - `1` : au moins un échec ;
-- `77` : tous les tests exécutés ont été SKIPpés (comptabilisé comme « skip » par cpp-maker).
+- `77` : tous les tests exécutés ont été SKIPpés (comptabilisé comme « skip »).
+
+**Note** : `cmd_test` ne relâche pas le verrou avant l'exécution ; les tests ne doivent pas invoquer cpp-maker.
 
 ### 8.8 `check` — tests multi-modes
 
@@ -928,27 +929,25 @@ cpp-maker check [options]
 
 Pour chaque mode : compile les tests, exécute, agrège les résultats dans un seul rapport.
 
-**Exemple** :
-
 ```sh
 cpp-maker check --modes debug,asan,ubsan --junit report.xml
 ```
 
-### 8.9 `generate` — génération de fichiers pour IDE/ninja
+### 8.9 `generate` — fichiers pour IDE/ninja
 
 ```sh
 cpp-maker generate <ninja|compdb> [mode] [options]
 ```
 
 - `ninja` : écrit `build/<tc>/<mode>/build.ninja` (utilisable via `ninja -f build/host/release/build.ninja`) ;
-- `compdb` : écrit `compile_commands.json` à la racine (pour clangd, VSCode C/C++, etc.).
+- `compdb` : écrit `compile_commands.json` **à la racine** (pour clangd, VSCode C/C++, ccls…).
 
 ```sh
 cpp-maker generate compdb
 cpp-maker generate ninja release
 ```
 
-**Note** : `build` et `run` régénèrent automatiquement `compile_commands.json` dans le répertoire du build.
+**Note** : `build` et `run` régénèrent automatiquement `compile_commands.json` **dans le répertoire du build** à chaque invocation ; `generate compdb` l'écrit **à la racine**.
 
 ### 8.10 `clean` — supprimer les artefacts
 
@@ -963,16 +962,13 @@ cpp-maker clean [mode] [options]
 
 **Comportement** :
 
-- Sans arg : supprime **tout** `build/` ;
+- Sans argument : supprime **tout** `build/` (y compris `build/generate/`) ;
 - Avec `-t host` : supprime `build/host/` ;
-- Avec `-t host release` : supprime `build/host/release/`.
+- Avec `-t host release` : supprime `build/host/release/` ;
+- Avec un mode seul (`cpp-maker clean release`) : pour **chaque** toolchain, supprime `build/<tc>/release` ;
+- `--all` : ajoute la suppression de `dist/`.
 
-```sh
-cpp-maker clean
-cpp-maker clean release
-cpp-maker clean -t host release
-cpp-maker clean --all
-```
+Le verrou est posé pendant l'opération, pour éviter un clean concurrent avec un build.
 
 ### 8.11 `package` — créer des paquets
 
@@ -1001,6 +997,8 @@ cpp-maker package [mode] [options]
 **Debian** : produit un `.deb` valide (`dpkg-deb` requis) avec `DEBIAN/control`, `Installed-Size`, `Depends`.
 
 **Checksums** : si `[package].checksums = true`, un fichier `<nom>-<version>-<os>-<arch>.sha256` est ajouté.
+
+**Format `stage`** : pas d'archive produite, le staging reste dans `build/<tc>/<mode>/stage/<name>-<version>-<os>-<arch>/`.
 
 ```sh
 cpp-maker package release --format tar.gz,deb
@@ -1041,7 +1039,7 @@ method = "rsync"             # rsync | scp | copy | script
 host = "raspberrypi.local"
 user = "pi"
 port = 22
-path = "/home/pi/{name}"     # variables : {name} {version} {toolchain} {mode} {artifact} {path}
+path = "/home/pi/{name}"     # variables : {name} {version} {toolchain} {mode} {host} {artifact} {path}
 toolchain = "armhf"
 mode = "release"
 artifact = "stage"           # stage | tar.gz | tar.xz | zip | deb
@@ -1061,13 +1059,18 @@ method = "rsync"
 host = "user@machine"
 target_dir = "/opt/myapp"
 pre = ["…"]
-post = ["…"]                 # exécuté localement
-script = "deploy.sh"
-```
+post = ["…"]                 #*(suite du §8.13)*
 
-`method = "script"` : exécute `<script>` localement avec `$CPP_MAKER_DIST` = chemin du staging.
+`method = "script"` : exécute `<script>` localement avec `$CPP_MAKER_DIST` = chemin absolu du staging.
 
 **Variables d'expansion** : `{name}`, `{version}`, `{toolchain}`, `{mode}`, `{host}`, `{artifact}`, `{path}`.
+
+**Ordre d'exécution** :
+1. `before` (local) ;
+2. `mkdir -p <path>` distant (sauf `copy`) ;
+3. transfert (`rsync`/`scp`/`copy`/`script`) ;
+4. `after` (distant, sauf `copy`/`script`) ;
+5. `after_local` (local).
 
 ```sh
 cpp-maker deploy rpi
@@ -1075,17 +1078,19 @@ cpp-maker deploy rpi --dry-run
 cpp-maker deploy --list
 ```
 
+Un échec de transfert interrompt le déploiement (code non nul).
+
 ### 8.14 `graph` — graphe des dépendances
 
 ```sh
 cpp-maker graph [--dot] [-a]
 ```
 
-Sans option : arbre ASCII des modules et de leurs dépendances.
+Sans option : arbre ASCII des modules et de leurs dépendances. Seuls les modules **racines** (qui ne sont dépendance d'aucun autre) sont affichés par défaut ; `-a` (ou `--all`) inclut aussi les dépendances.
 
-Avec `--dot` : sortie Graphviz (à piper vers `dot -Tsvg`).
+Avec `--dot` : sortie Graphviz (`digraph`). Si `[layers]` est configuré, chaque couche devient un sous-graphe (`cluster_<layer>`) ; les dépendances `pkg-config` apparaissent en pointillés (`style=dashed`).
 
-`-a` (ou `--all`) : inclut les dépendances (par défaut, seuls les modules racines sont affichés).
+Profondeur limitée à 32 pour éviter les cycles non détectés.
 
 ```sh
 cpp-maker graph
@@ -1098,15 +1103,24 @@ cpp-maker graph --dot > graph.dot && dot -Tsvg graph.dot -o graph.svg
 cpp-maker modules
 ```
 
-Sortie tabulaire : nom, type, couche, dossier, dépendances.
+Sortie tabulaire : nom, type, couche, dossier, dépendances (modules, `pkg:<nom>`, `-l<nom>`).
 
-### 8.16 `info` — résumé
+### 8.16 `info` — résumé du projet ou détail d'un module
+
+```sh
+cpp-maker info [-m <module>[,<module>…]]
+```
+
+- **Sans `-m`** : résumé du projet (racine, standards, défauts, modes, toolchains, modules, déploiements) et détail de la toolchain par défaut (cc, cxx, ar, strip, triple, arch, os, runner).
+- **Avec `-m`** : détail complet du module demandé — type, couche, version, description, standards effectifs, `source_dirs` / `source_files` / `exclude`, `main`, includes public/private, `test_dirs`, dépendances (modules, pkg-config, système, frameworks, git), flags, overrides de plateforme, `install`, fermeture transitive, **sources réellement découvertes** (utile pour vérifier `exclude` et `source_files`), et modules qui l'utilisent (`reverse deps`).
+
+**Recherche du module** : d'abord par nom logique (`name =` du `module.toml`), puis par nom de dossier en secours. Le second mode rend `-m ui_patchbay` fonctionnel quand `dir = "ui_patchbay"` mais que le `module.toml` déclare `name = "audio_patchbay"`.
 
 ```sh
 cpp-maker info
+cpp-maker info -m core
+cpp-maker info -m audio_patchbay,core
 ```
-
-Affiche : racine, projet, standards, défauts, modes, toolchains, modules, déploiements, et le détail de la toolchain par défaut (cc, cxx, ar, strip, triple, arch, os, runner).
 
 ### 8.17 `size` — analyse ELF
 
@@ -1114,16 +1128,17 @@ Affiche : racine, projet, standards, défauts, modes, toolchains, modules, dépl
 cpp-maker size [mode] [options]
 ```
 
-Analyse les binaires de `build/<tc>/<mode>/{bin,lib,tests}` avec un **parser ELF intégré** (aucune dépendance à `binutils`).
+Analyse les binaires de `build/<tc>/<mode>/{bin,lib,tests}` avec un **parser ELF intégré** (aucune dépendance à `binutils` — donc lisible pour les binaires croisés même sans binutils cible).
 
 | Colonne | Signification |
 |---|---|
 | `text` | sections allocables **non inscriptibles** (code, `.rodata`) — sémantique Berkeley `size` |
-| `data` | sections allocables **inscriptibles** (`.data`, `.bss` compté séparément) |
+| `data` | sections allocables **inscriptibles** (`.data`, `.data.rel.ro`…) |
 | `bss` | sections `SHT_NOBITS` allocables (`.bss`, `.tbss`) |
 | `dec` | `text + data + bss` |
+| `hex` | `dec` en hexadécimal |
 
-Pour les **archives `.a`**, les membres ELF sont sommés.
+Pour les **archives `.a`**, les membres ELF sont sommés (les sections sont cumulées par nom de sortie, `.text._Z…` → `.text`).
 
 **Sortie typique** :
 
@@ -1135,7 +1150,14 @@ build/host/release — toolchain host · mode release
         1243        512          8       1763        6e3
 ```
 
-`-v` : top 10 des sections par taille.
+`-v` : top 10 des sections par taille. `-m <module>` : filtre sur les exécutables `<nom>` / `<nom>-tests` et bibliothèques `lib<nom>.*`.
+
+Les fichiers PE (Windows) ne sont pas parsés.
+
+```sh
+cpp-maker size release
+cpp-maker size release -m hello -v
+```
 
 ### 8.18 `doctor` — diagnostic
 
@@ -1146,20 +1168,24 @@ cpp-maker doctor [--no-fix|--check-deps]
 Vérifie :
 
 1. **Configuration** : `cpp-maker.toml` présent, valide (`cfg::validate_errors`) ;
-2. **Outils** : `ar`, `pkg-config`, `ninja`, `tar`, `zip`, `dpkg-deb`, `sha256sum`, `rsync`, `ssh`, `valgrind`, `qemu-arm`, `qemu-aarch64`, `wine` ;
-3. **Toolchains** : pour chacune, `smoke_compile` C et C++, sanitizers, runner ;
-4. **Dépendances entre modules** : analyse statique des `#include`, détecte les dépendances implicites manquantes. Par défaut, **corrige** les `module.toml` (avec revalidation + rollback).
+2. **Outils** : `ar` (obligatoire), `pkg-config`, `ninja`, `tar`, `zip`, `dpkg-deb`, `sha256sum`, `rsync`, `ssh`, `valgrind`, `qemu-arm`, `qemu-aarch64`, `wine` ;
+3. **Toolchains** : pour chacune, `smoke_compile` C et C++, puis sanitizers (`address`, `thread`, `undefined`, `leak`, `memory`), puis runner ;
+4. **Dépendances entre modules** : analyse statique des `#include` (sources + en-têtes), détecte les dépendances implicites manquantes (une cible `#include` un en-tête public d'un module non joignable par la fermeture transitive des deps déclarées). Par défaut, **corrige** les `module.toml` (édition atomique, revalidation, rollback).
 
 | Option | Effet |
 |---|---|
 | `--no-fix` | Signale mais ne modifie pas |
-| `--check-deps` | Signale sans modifier, et compte comme problème |
+| `--check-deps` | Signale sans modifier, et compte les deps manquantes comme des problèmes (utile en CI) |
+
+Code retour : `0` si aucun problème, `1` sinon.
+
+L'auto-fix refuse les configurations v0.4 (plusieurs modules dans un même fichier) et les modules `from_git`.
 
 ### 8.19 `config` — inspecter/modifier la config
 
 #### `config show [clé…]`
 
-Affiche la configuration effective (après défauts) au format `clé = valeur`.
+Affiche la configuration effective (après défauts) au format `clé = valeur`. Scalaires entre guillemets, tableaux entre crochets.
 
 ```sh
 cpp-maker config show                 # tout
@@ -1168,11 +1194,11 @@ cpp-maker config show build.jobs      # clé exacte
 cpp-maker config show project.name build.warnings
 ```
 
-Suggestion pour les clés inconnues : `nam` → `(essayez : project.name)`.
+Un filtre matche la clé exacte **et/ou** son préfixe suivi de `.` (`build`, `toolchains.host`, `modes.release`…). Suggestion pour les clés inconnues : `nam` → `(essayez : project.name)`.
 
 #### `config validate`
 
-Charge et valide la configuration. Code retour 0 si valide, 1 sinon.
+Charge et valide la configuration. Code retour `0` si valide, `1` sinon.
 
 ```sh
 cpp-maker config validate
@@ -1182,10 +1208,12 @@ cpp-maker config validate
 
 Modifie une clé **scalaire** de `cpp-maker.toml` de manière contrôlée :
 
-1. La clé doit être dans la liste blanche (`project.name`, `project.version`, `build.jobs`, `module.type`, `compiler.cxx`…) ;
-2. Réécrit la ligne (`indent = clé = nouvelle_valeur`) ;
+1. La clé doit être dans la liste blanche (`project.name`, `project.version`, `project.type`, `project.standard`, `project.c_standard`, `project.description`, `module.type`, `compiler.cxx`, `compiler.cc`, `compiler.family`, `build.default_mode`, `build.default_toolchain`, `build.jobs`) ;
+2. Réécrit la ligne en conservant l'indentation ;
 3. Écrit dans `.tmp`, **recharge et revalide** la config complète ;
 4. Si valide : `rename(tmp, file)`, sinon supprime le tmp et laisse le fichier **intact**.
+
+La clé doit exister dans le fichier (pas de création). `build.jobs` exige une valeur entière.
 
 ```sh
 cpp-maker config set build.jobs 4
@@ -1197,11 +1225,11 @@ cpp-maker config set project.standard c++20
 
 #### `toolchain list` (ou `ls`)
 
-Affiche : toolchains du projet, toolchains intégrées, préfixes détectés dans le `$PATH`, versions gcc/g++ installées.
+Affiche : toolchains du projet, toolchains intégrées (`host`, `gcc`, `clang`), préfixes détectés dans le `$PATH` (utilisables avec `-t <triplet>`), versions gcc/g++ installées (avec la version par défaut marquée).
 
 #### `toolchain show [nom]`
 
-Affiche en détail la toolchain résolue (cc, cxx, ar, strip, triple, arch, os, runner, pkg-config).
+Affiche en détail la toolchain résolue (cc, cxx, ar, strip, triple, arch, os, runner, pkg-config, répertoire de build).
 
 #### `toolchain which [nom]`
 
@@ -1209,17 +1237,15 @@ Affiche le chemin du `cxx` puis du `cc`.
 
 #### `toolchain use <version>`
 
-Debian/Ubuntu uniquement. Configure `/usr/bin/gcc-<N>` comme défaut via `update-alternatives` :
+Debian/Ubuntu uniquement. Configure `/usr/bin/gcc-<N>` comme défaut via `update-alternatives` (avec `--install` puis `--set`). Vérifie que `g++` pointe bien sur la version demandée ; sinon, affiche un diagnostic complet (`update-alternatives --display gcc`) et retourne `1`.
 
 ```sh
 cpp-maker toolchain use 14
 ```
 
-Vérifie que `g++` pointe bien sur la version demandée ; sinon, affiche un diagnostic.
-
 #### `toolchain install <version|triplet>`
 
-Debian/Ubuntu uniquement.
+Debian/Ubuntu uniquement (`/etc/debian_version` + `apt-get`).
 
 - `cpp-maker toolchain install 14` : ajoute le PPA `ubuntu-toolchain-r/test`, installe `gcc-14` + `g++-14` ;
 - `cpp-maker toolchain install arm-linux-gnueabihf` : installe `gcc-<triplet>` + `g++-<triplet>` + `qemu-user` ;
@@ -1229,15 +1255,50 @@ Debian/Ubuntu uniquement.
 
 #### `toolchain remove <version>`
 
-Purge `gcc-<N>` et `g++-<N>` (refuse si c'est la version par défaut).
-
-### 8.21 `help` — aide
+Purge `gcc-<N>` et `g++-<N>` (`apt-get purge --autoremove`). Refuse si c'est la version par défaut (utilisez `use` d'abord pour changer).
 
 ```sh
-cpp-maker help               # liste toutes les commandes
+cpp-maker toolchain install 14
+cpp-maker toolchain use 14
+cpp-maker toolchain remove 12
+```
+
+### 8.21 `backup` — exporter un module en XML
+
+```sh
+cpp-maker backup [module] [-m <nom>] [--file <fichier>] [options]
+```
+
+| Option | Description |
+|---|---|
+| `-m <modules>` | Modules à sauvegarder. Défaut : module courant, ou tous les modules du workspace si vous êtes à la racine. |
+| `--file <fichier>` | Fichier XML de sortie. `-` = stdout. `--out` reste accepté en alias. |
+| `--to-stdout` | Écrit sur stdout (équivalent à `--file -`). |
+| `--no-sources`, `--no-headers`, `--no-tests` | Exclut la catégorie correspondante. |
+
+Par défaut, le fichier va dans `[paths].backups_dir` (défaut `.backups/`) :
+- `.backups/backup-<module>.xml` (un module) ;
+- `.backups/backup.xml` (plusieurs modules, racine `<backup>` + enfants `<module>`).
+
+Le contenu est encodé en CDATA (avec split sûr de `]]>`), les octets de contrôle sont retirés : la sortie reste un XML valide même si un fichier contient des octets binaires accidentels. Les chemins internes sont relatifs au dossier du module ; l'attribut `dir` du `<module>` permet de reconstituer l'emplacement exact.
+
+Les options globales `--stdout` / `--stderr` / `--output` restent **orthogonales** à `--file` : `--stdout snapshot.xml` redirige le `std::cout` (dans `.out/snapshot.xml` par défaut), et un backup écrit sur `std::cout` (via `--file -`) y atterrit.
+
+```sh
+cpp-maker backup                                  # .backups/backup-<module>.xml
+cpp-maker backup -m ui --file /tmp/ui.xml
+cpp-maker backup -m ui --file - | xmllint --format -
+cpp-maker backup -m ui,core,audio                 # un seul XML multi-modules
+```
+
+### 8.22 `help` — aide
+
+```sh
+cpp-maker help               # liste toutes les commandes par catégorie
 cpp-maker help build         # aide détaillée de "build"
-cpp-maker help list          # idem "help" sans argument
-cpp-maker <cmd> --help       # équivalent
+cpp-maker help modes         # modes de compilation prédéfinis
+cpp-maker help sanitize      # catalogue des sanitizers
+cpp-maker <cmd> --help       # équivalent (avant parse_opts)
 ```
 
 ---
@@ -1262,7 +1323,6 @@ cpp-maker build release --tests             # build release + tests compilés
 ### 9.3 Cross-compilation
 
 ```sh
-# Une fois : configurer la toolchain
 cpp-maker toolchain install arm-linux-gnueabihf
 cpp-maker build -t arm-linux-gnueabihf release
 cpp-maker test  -t arm-linux-gnueabihf release     # via qemu-arm si dispo
@@ -1312,6 +1372,14 @@ cpp-maker config set project.standard c++23
 cpp-maker module rename core base
 ```
 
+### 9.9 Déboguer un problème mémoire
+
+```sh
+cpp-maker test --sanitize address,undefined
+cpp-maker run --sanitize all                    # une passe par runtime
+cpp-maker run --mode valgrind                   # sans instrumentation
+```
+
 ---
 
 ## 10. Dépannage
@@ -1333,7 +1401,7 @@ cpp-maker new hello --standard c++17   # ou baisser le standard
 
 ### « module inconnu »
 
-`cpp-maker modules` pour lister les modules disponibles. Vérifiez `[workspace].modules` et le nom déclaré dans `module.toml`.
+`cpp-maker modules` pour lister les modules disponibles. Vérifiez `[workspace].modules` et le `name` déclaré dans `module.toml`.
 
 ### « dépendance git introuvable »
 
@@ -1375,9 +1443,13 @@ mkdir -p libs/core libs/net
 
 Le binaire est peut-être un script ou corrompu ; vérifiez avec `file <binaire>`. Ou passez `--no-strip`.
 
+### « module 'X' (static) : aucune source C/C++ dans src »
+
+Le dossier de sources déclaré est vide ou toutes les sources sont exclues (`exclude`). Vérifiez `source_dirs`, `source_files`, `exclude`, et le résultat de `cpp-maker info -m X` (liste des sources réellement découvertes).
+
 ### Build qui semble toujours tout recompiler
 
-- Vérifiez que vous n'avez pas `--clean` ou `-a` dans un script ;
+- Vérifiez que vous n'avez pas `--clean` dans un script ;
 - Vérifiez que le mtime des sources est stable (`git checkout` peut changer les mtimes) ;
 - `cpp-maker build -v` pour voir les commandes et diagnostiquer.
 
@@ -1391,33 +1463,109 @@ Normal si aucun runner n'est disponible pour l'architecture cible. Installez `qe
 
 ---
 
-## Annexe A — Variables et chemins
+## 11. Compilation de cpp-maker
+
+### Sources
+
+cpp-maker se compile avec un compilateur C++23 (g++ 13+ ou clang 16+). Les 17 fichiers `.cpp` du dépôt :
+
+```
+main.cpp util.cpp proc.cpp toml.cpp toolchain.cpp cfg.cpp
+build.cpp deps.cpp elf.cpp output.cpp sanitize.cpp
+cmd-backup.cpp cmd-build.cpp cmd-config.cpp cmd-deploy.cpp
+cmd-helpers.cpp cmd-project.cpp
+```
+
+Plus `flags.hpp` (header-only) et `cpp-maker.hpp`.
+
+```sh
+g++ -std=c++23 -O2 -pthread -o cpp-maker \
+    main.cpp util.cpp proc.cpp toml.cpp toolchain.cpp cfg.cpp \
+    build.cpp deps.cpp elf.cpp output.cpp sanitize.cpp \
+    cmd-backup.cpp cmd-build.cpp cmd-config.cpp cmd-deploy.cpp \
+    cmd-helpers.cpp cmd-project.cpp
+```
+
+Sous Windows (MinGW-w64) : mêmes fichiers, remplacer `-pthread` par `-static-libgcc -static-libstdc++` si vous voulez un binaire autonome.
+
+### Modes instrumentés
+
+Les trois modes instrumentés coexistent dans des sous-répertoires distincts : vous pouvez basculer de l'un à l'autre sans `clean` intermédiaire.
+
+| Mode | Flags | Dossier |
+|---|---|---|
+| release | `-O2` | `build/release/` |
+| debug | `-O0 -g3` | `build/debug/` |
+| asan | `-O1 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer` | `build/asan/` |
+| tsan | `-O1 -g3 -fsanitize=thread -fno-omit-frame-pointer` | `build/tsan/` |
+
+Exemples de commandes :
+
+```sh
+# Release
+g++ -std=c++23 -O2 -pthread -o build/release/cpp-maker <fichiers>
+
+# Debug
+g++ -std=c++23 -O0 -g3 -pthread -o build/debug/cpp-maker <fichiers>
+
+# ASan + UBSan
+g++ -std=c++23 -O1 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -pthread -o build/asan/cpp-maker <fichiers>
+
+# TSan
+g++ -std=c++23 -O1 -g3 -fsanitize=thread -fno-omit-frame-pointer \
+    -pthread -o build/tsan/cpp-maker <fichiers>
+```
+
+### Tests de fumée
+
+Après compilation, vérifiez sur un projet jetable :
+
+```sh
+./build/release/cpp-maker --version
+mkdir /tmp/smoke && cd /tmp/smoke
+/path/to/build/release/cpp-maker new hello
+cd hello
+/path/to/build/release/cpp-maker build
+/path/to/build/release/cpp-maker test
+/path/to/build/release/cpp-maker run
+```
+
+Les quatre étapes doivent réussir sans warning bloquant. Sous ASan/TSan, un `test` sur le squelette généré ne doit produire aucun rapport.
+
+---
+
+## 12. Aide-mémoire
+
+### Variables d'environnement
 
 | Variable | Effet |
 |---|---|
 | `$CC` / `$CXX` | Compilateur par défaut de la toolchain `host` |
-| `$PATH` | Sert à localiser les outils et les préfixes de triplet |
+| `$PATH` | Localisation des outils et des préfixes de triplet |
 | `$HOME` / `$XDG_CACHE_HOME` / `$CPP_MAKER_CACHE` | Cache des dépôts Git |
+| `%LOCALAPPDATA%` | Cache Git sous Windows (si `CPP_MAKER_CACHE` absent) |
 | `$NO_COLOR` | Désactive la couleur |
 
-Chemins produits :
+### Fichiers produits
 
 | Chemin | Contenu |
 |---|---|
-| `build/<tc>/<mode>/obj/` | Fichiers `.o` + `.d` + `.stamp` |
+| `build/<tc>/<mode>/obj/` | `.o` + `.d` + `.stamp` |
 | `build/<tc>/<mode>/bin/` | Exécutables |
-| `build/<tc>/<mode>/lib/` | Bibliothèques |
+| `build/<tc>/<mode>/lib/` | Bibliothèques (+ `.pc` en staging) |
 | `build/<tc>/<mode>/tests/` | Exécutables de test |
-| `build/<tc>/<mode>/compile_commands.json` | Pour clangd |
+| `build/<tc>/<mode>/compile_commands.json` | Pour clangd (régénéré à chaque build) |
 | `build/<tc>/<mode>/build.ninja` | Backend ninja |
 | `build/<tc>/<mode>/install_manifest.txt` | Fichiers installés |
+| `build/<tc>/<mode>/stage/` | Staging de `package` |
+| `build/generate/<nom>.stamp` | Stamps `[generate.*]` |
 | `dist/` | Paquets produits |
-| `.cpp-maker.lock` | Verrou de concurrence |
-| `cpp-maker.lock` | Versions Git verrouillées |
+| `.cpp-maker.lock` | Verrou de concurrence (PID) |
+| `cpp-maker.lock` | Versions Git verrouillées (à committer) |
+| `compile_commands.json` (racine) | Produit par `generate compdb` |
 
----
-
-## Annexe B — Aide-mémoire
+### Commandes essentielles
 
 ```sh
 # Projet
@@ -1426,16 +1574,16 @@ cpp-maker new app --workspace                # workspace
 cpp-maker add libs/core --type static        # ajouter un module
 cpp-maker modules                            # lister les modules
 cpp-maker graph                              # arbre des deps
-cpp-maker info                               # résumé config
+cpp-maker info -m core                       # détail d'un module
 
 # Build
 cpp-maker build                              # debug
 cpp-maker build release                      # release
 cpp-maker build -t all                       # toutes toolchains
-cpp-maker build -j 8                         # 8 workers
+cpp-maker build -j 8                         # 8 workers (plafonné à ncpus-1)
 cpp-maker build -k                           # keep-going
 cpp-maker build --backend ninja              # backend ninja
-cpp-maker generate compdb                    # compile_commands.json
+cpp-maker generate compdb                    # compile_commands.json à la racine
 
 # Test
 cpp-maker test                               # tests debug
@@ -1445,14 +1593,20 @@ cpp-maker test --junit r.xml                 # rapport JUnit
 cpp-maker check                              # debug+asan+tsan
 cpp-maker check --modes debug,ubsan          # autre combinaison
 
+# Sanitizers
+cpp-maker test --sanitize address,undefined
+cpp-maker test --sanitize all
+cpp-maker run --sanitize leak --no-sanitize-recover all
+
 # Run
 cpp-maker run                                # exécute l'unique binaire
 cpp-maker run -m myapp                       # exécutable myapp
 cpp-maker run --args --port 8080             # avec arguments
+cpp-maker valgrind                           # alias run --mode valgrind
 
 # Clean
 cpp-maker clean                              # tout build/
-cpp-maker clean release                      # un mode
+cpp-maker clean release                      # un mode (toutes toolchains)
 cpp-maker clean -t host release              # un mode d'une toolchain
 cpp-maker clean --all                        # build/ + dist/
 
@@ -1476,36 +1630,40 @@ cpp-maker toolchain which gcc
 cpp-maker toolchain install 14
 cpp-maker toolchain use 14
 cpp-maker toolchain remove 12
+
+# Export
+cpp-maker backup -m core --file - | xmllint --format -
+
+# Aide
+cpp-maker help
+cpp-maker help build
+cpp-maker help modes
+cpp-maker help sanitize
 ```
+
+### Glossaire
+
+| Terme | Définition |
+|---|---|
+| **Projet** | Dossier racine contenant `cpp-maker.toml` |
+| **Module** | Unité de compilation/linkage (`executable`, `static`, `shared`, `header-only`) |
+| **Workspace** | Projet multi-modules (`[workspace].modules = […]`) |
+| **Mode** | Jeu de flags + defines (`release`, `debug`, `asan`…) |
+| **Toolchain** | Compilateurs + outils + cible (`host`, `armhf`, `win64`…) |
+| **Tâche** | Unité d'exécution du DAG (compile, archive, link, link-tests) |
+| **Plan** | DAG de tâches calculé pour (projet, toolchain, mode, modules) |
+| **Empreinte** | Hash FNV-1a qui décide si une tâche est à jour |
+| **Stamp** | Fichier `<sortie>.stamp` contenant l'empreinte de la dernière exécution réussie |
+| **Depfile** | Fichier `.d` (via `-MMD -MP`) listant les `#include` transitifs |
+| **Runner** | Émulateur (`qemu-*`, `wine`) préfixant l'exécution cross |
+| **Sanitizer** | Instrumentation mémoire/comportementale (`address`, `thread`…) |
 
 Avec cette documentation, un utilisateur n'ayant jamais vu cpp-maker peut :
 1. Créer un projet (`cpp-maker new`) et comprendre son arborescence ;
 2. Comprendre les 4 types de modules et la différence mono-module/workspace ;
 3. Configurer une toolchain cross-compilée ;
-4. Définir un mode personnalisé ;
+4. Définir un mode personnalisé et ajouter des sanitizers ;
 5. Écrire un `module.toml` complet ;
 6. Utiliser les 22 commandes avec toutes leurs options ;
 7. Diagnostiquer et résoudre les erreurs courantes ;
 8. Intégrer cpp-maker dans un workflow CI (package + deploy) ou IDE (compdb).
-
----
-
-## 11. Compilation de cpp-maker
-
-### Résumé des commandes
-
-| Commande              | Effet                                              |
-|-----------------------|----------------------------------------------------|
-| `make release`        | build `-O2` dans `build/release/`                  |
-| `make debug`          | build `-O0 -g3` dans `build/debug/`                |
-| `make asan`           | build ASan+UBSan dans `build/asan/`                |
-| `make tsan`           | build TSan dans `build/tsan/`                      |
-| `make test`           | tests de fumée sur le mode courant                 |
-| `make test-asan`      | tests sous ASan+UBSan                              |
-| `make test-tsan`      | tests sous TSan                                    |
-| `make test-valgrind`  | tests sous valgrind (binaire debug)                |
-| `make test-all`       | les quatre suites ci-dessus                        |
-
-Les trois modes instrumentés (`asan`, `tsan`, `debug`) coexistent dans
-des sous-répertoires distincts : vous pouvez basculer de l'un à l'autre
-sans `clean` intermédiaire.
